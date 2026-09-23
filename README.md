@@ -38,7 +38,7 @@ Virtual Joystick replaces a physical RC controller with a single webcam and a ba
 
 ## Gesture Controls
 
-<img src="media/gesture-controls-chart.jpg" alt="Gesture controls chart" width="300" align="right">
+<img src="media/gesture-controls-chart.jpg" alt="Gesture controls chart" width="300" align="center">
 
 | Gesture | Robot Action | Mechanism |
 |---|---|---|
@@ -196,8 +196,8 @@ Distributed under the MIT License. See [`LICENSE`](LICENSE) for details.
 ## Contact
 
 **Author:** Nomun ([@rootmesh3](https://github.com/rootmesh3)) — repo: [cv-gesture-rover-esp32](https://github.com/rootmesh3/cv-gesture-rover-esp32)
-LinkedIn: *add your link here*
-Email: *add your email here*
+LinkedIn: www.linkedin.com/in/sheikhnomun
+YouTube: www.youtube.com/@thenomunfactor
 
 ---
 
