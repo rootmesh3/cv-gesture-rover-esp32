@@ -49,8 +49,15 @@ UDP_INTERVAL = 1.0 / UDP_RATE_HZ
 # Speed ratio: dist(ThumbTip→IndexTip) / dist(Wrist→MiddleBase)
 SPEED_RATIO_MIN = 0.15     # Fully pinched → 0 %
 SPEED_RATIO_MAX = 1.30     # Fingers fully spread → 100 %
-SPEED_DEAD_ZONE = 5        # Values below this snap to 0
+SPEED_DEAD_ZONE = 5        # Values below this snap to 0 (applied to |speed|)
 TILT_DEAD_ZONE  = 10       # Angles within ±10 deg treated as Straight
+
+# ─── Reverse Gear ─────────────────────────────────────────────────────────────
+# Fixed reverse speed (negative integer) sent directly to the ESP.
+# The ESP firmware interprets negative S values as reverse motor direction.
+# Trigger: palm facing down, i.e. MiddleBase[9].y > Wrist[0].y + 0.15
+REVERSE_SPEED       = -90   # % power in reverse (negative, fixed magnitude)
+PALM_DOWN_THRESHOLD = 0.15  # Normalised Y-distance threshold for palm-down detect
 
 # ─── EMA Smoothing ────────────────────────────────────────────────────────────
 # alpha=1.0 = no smoothing; alpha=0.1 = very heavy smoothing (more lag)
@@ -162,7 +169,31 @@ def audio_thread_fn() -> None:
     Consumes text items from `audio_queue` and speaks them.
     A `None` sentinel value signals clean shutdown.
     pyttsx3.runAndWait() is blocking, so we isolate it here.
+
+    Windows SAPI5 COM fix:
+        pyttsx3 on Windows uses the SAPI5 COM automation API.  COM objects
+        are apartment-threaded and MUST be initialised on each thread that
+        uses them.  Without CoInitialize() the engine initialises on the main
+        thread's COM apartment and then silently deadlocks on the second
+        runAndWait() call (or sometimes the first) when invoked from a
+        background thread.  Calling pythoncom.CoInitialize() here, before
+        pyttsx3.init(), registers this thread with a new STA apartment and
+        keeps every subsequent SAPI5 call within the correct COM context.
     """
+    # ── Windows COM initialisation (must be first, before pyttsx3.init) ───────
+    try:
+        import pythoncom
+        pythoncom.CoInitialize()
+        log.info("COM STA initialized for audio thread (Windows SAPI5).")
+    except ImportError:
+        log.warning(
+            "pythoncom not found — install pywin32 if audio freezes after the "
+            "first announcement:  pip install pywin32"
+        )
+    except Exception as exc:
+        log.warning(f"COM init warning (non-fatal): {exc}")
+
+    # ── pyttsx3 engine ────────────────────────────────────────────────────────
     try:
         engine = pyttsx3.init()
         engine.setProperty("rate",   155)
@@ -250,7 +281,7 @@ def udp_thread_fn() -> None:
         try:
             sock.sendto(payload.encode("utf-8"), (ESP_IP, ESP_PORT))
             if payload != last_payload:
-                log.debug(f"UDP TX -> {payload}")
+                log.info(f"UDP TX -> {payload}")   # log.info so packets are visible in terminal
                 last_payload = payload
         except OSError as exc:
             log.warning(f"UDP send error (will retry): {exc}")
@@ -277,12 +308,59 @@ def _dist(a, b) -> float:
 
 def is_fist(lm: list) -> bool:
     """
-    Returns True when all four fingers are curled (emergency stop).
-    In image space, y increases downward; a curled finger tip sits
-    below (higher y than) its PIP joint.
-    Pairs: (Tip, PIP)  →  Index(8,6), Middle(12,10), Ring(16,14), Pinky(20,18)
+    ROBUST distance-based fist detection (Emergency Stop).
+
+    WHY the old tip.y > pip.y method was flawed:
+        Raw Y-coordinate comparison only works when the hand is held upright.
+        Tilt the hand downward 90° and every finger tip has a HIGHER y-value
+        than its PIP joint even when the fingers are fully extended — triggering
+        false emergency stops whenever the user points the hand downward.
+
+    NEW METHOD — purely distance-based, orientation-independent:
+        When a finger is curled, its tip folds back toward the palm and
+        therefore ends up CLOSER to the wrist than the PIP joint does.
+
+        For each finger:
+            dist(Tip → Wrist)  <  dist(PIP → Wrist)  →  finger is curled
+
+        Tested landmark pairs  (Tip index, PIP index):
+            Index  → (8,  6)
+            Middle → (12, 10)
+            Ring   → (16, 14)
+            Pinky  → (20, 18)
+
+        All four must be curled for a confirmed fist.
+        (Thumb excluded: its curl geometry differs and is already used for speed.)
     """
-    return all(lm[tip].y > lm[pip].y for tip, pip in [(8,6),(12,10),(16,14),(20,18)])
+    pairs = [(8, 6), (12, 10), (16, 14), (20, 18)]
+    for tip_idx, pip_idx in pairs:
+        tip_to_wrist = _dist(lm[tip_idx], lm[0])
+        pip_to_wrist = _dist(lm[pip_idx], lm[0])
+        if tip_to_wrist >= pip_to_wrist:
+            return False   # At least one finger is NOT fully curled — not a fist
+    return True
+
+
+def is_palm_down(lm: list) -> bool:
+    """
+    Detects a downward-pointing hand — the Reverse Gear trigger.
+
+    Geometry:
+        In OpenCV image space Y increases downward (0 = top of frame).
+        When the hand points UP:   MiddleBase[9].y  <  Wrist[0].y
+        When the hand points DOWN: MiddleBase[9].y  >  Wrist[0].y
+
+        We require a margin of PALM_DOWN_THRESHOLD (0.15 = 15 % of frame
+        height in normalised coords) to prevent accidental triggering during
+        nearly-horizontal gestures where the hand is only slightly tilted.
+
+    Ergonomic usage:
+        The user holds the hand with fingers pointing downward (like pressing
+        a table). The gesture is stable, anatomically distinct from the
+        forward-drive posture, and easy to hold while simultaneously tilting
+        for left/right steering.
+    """
+    return lm[9].y > lm[0].y + PALM_DOWN_THRESHOLD
 
 
 def compute_speed(lm: list) -> float:
@@ -314,11 +392,28 @@ def compute_tilt(lm: list) -> float:
 
 
 def classify_command(speed: int, tilt: int, fist: bool) -> str:
-    """Maps numeric state to a human-readable command label."""
+    """
+    Maps numeric state to a human-readable command label.
+
+    Speed sign convention:
+        speed > 0   → forward motion (0-100 %)
+        speed == 0  → stopped
+        speed < 0   → reverse motion (REVERSE_SPEED = -40)
+
+    Priority:  EMERGENCY STOP  >  REVERSE  >  FORWARD  >  STOP
+    """
     if fist:
         return "EMERGENCY STOP"
     if speed == 0:
         return "STOP"
+    if speed < 0:
+        # Reverse gear: steer normally while reversing
+        if tilt < -TILT_DEAD_ZONE:
+            return "REVERSE LEFT"
+        if tilt > TILT_DEAD_ZONE:
+            return "REVERSE RIGHT"
+        return "REVERSE"
+    # speed > 0: forward motion
     if tilt < -TILT_DEAD_ZONE:
         return "FORWARD LEFT"
     if tilt > TILT_DEAD_ZONE:
@@ -342,11 +437,18 @@ class SmartDebouncer:
     """
 
     _SPEECH_MAP = {
+        # ── Forward ────────────────────────────────────────────────────────────
         "STOP"           : "Stopped",
         "FORWARD"        : "Moving forward",
         "FORWARD LEFT"   : "Turning left",
         "FORWARD RIGHT"  : "Turning right",
         "EMERGENCY STOP" : "Emergency stop",
+        # ── Reverse ────────────────────────────────────────────────────────────
+        # Reverse is a fixed speed (-40), so no "accelerating / slowing down"
+        # announcements are needed — only the state-change announcement.
+        "REVERSE"        : "Reversing",
+        "REVERSE LEFT"   : "Reversing left",
+        "REVERSE RIGHT"  : "Reversing right",
     }
 
     def __init__(self):
@@ -366,7 +468,10 @@ class SmartDebouncer:
             self._speed_history.clear()
             return   # Don't also check trend in the same frame as a command change
 
-        # ── 2. Speed trend (only while actively driving) ───────────────────────
+        # ── 2. Speed trend (forward motion only) ──────────────────────────────
+        # Reverse uses a fixed speed (REVERSE_SPEED = -40); there is no
+        # meaningful speed trend to announce.  Only track trends while the
+        # user is actively driving forward.
         if command in ("FORWARD", "FORWARD LEFT", "FORWARD RIGHT"):
             self._speed_history.append(speed)
             if len(self._speed_history) >= TREND_WINDOW:
@@ -387,7 +492,7 @@ class SmartDebouncer:
                     # Once a trend levels off, allow it to fire again later
                     self._last_trend = ""
         else:
-            # Not actively driving: clear history so stale values don't pollute
+            # Reverse, Stop, Emergency Stop: no trend tracking needed
             self._speed_history.clear()
             self._last_trend = ""
 
@@ -489,20 +594,40 @@ def draw_iron_man_visuals(
 
     if speed == 0:
         # ── STOPPED: Solid red disc ───────────────────────────────────────────
+        # Filled = motor is off / parked.  Accessibility label: "STOP"
         _neon_circle(
             frame, center, RETICLE_BASE_R,
             dark_bgr=NEON_RED_DARK, mid_bgr=NEON_RED_MID, core_bgr=NEON_RED_CORE,
             filled=True, outer_thick=5, core_thick=-1,
         )
-        # Accessibility label "STOP" for color-blind users
         cv2.putText(
             frame, "STOP",
             (mid_x + label_x_offset, mid_y + 5),
             cv2.FONT_HERSHEY_SIMPLEX, 0.40, NEON_RED_CORE, 1, cv2.LINE_AA,
         )
+
+    elif speed < 0:
+        # ── REVERSE: Hollow amber/orange ring, fixed size ─────────────────────
+        # Hollow = motor IS running (just in reverse).
+        # Fixed radius (no pulse) because REVERSE_SPEED is a constant magnitude.
+        # Colour: amber (NEON_AMB family) — visually distinct from both
+        #   STOP (red)  and  GO-forward (cyan).
+        # Accessibility label: "REV"
+        _neon_circle(
+            frame, center, RETICLE_BASE_R + 3,
+            dark_bgr=NEON_AMB_DARK, mid_bgr=NEON_AMB_MID, core_bgr=NEON_AMB_CORE,
+            filled=False, outer_thick=5, core_thick=2,
+        )
+        cv2.putText(
+            frame, "REV",
+            (mid_x + RETICLE_BASE_R + 11, mid_y + 5),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.40, NEON_AMB_CORE, 1, cv2.LINE_AA,
+        )
+
     else:
-        # ── ACTIVE: Hollow cyan ring with speed-driven pulse ──────────────────
-        # Oscillation: sin wave at ~2 Hz (4 rad/s), amplitude scaled by speed
+        # ── ACTIVE FORWARD: Hollow cyan ring with speed-driven pulse ──────────
+        # Oscillation: sin wave at ~2 Hz (4 rad/s), amplitude scaled by speed.
+        # Delta strictly bounded 0-6 px so it never occludes adjacent landmarks.
         oscillation = 0.5 + 0.5 * math.sin(time.time() * 4.0)   # 0.0 -> 1.0
         pulse_delta = int(oscillation * PULSE_MAX_DELTA * (speed / 100.0))
         pulse_delta = max(0, min(PULSE_MAX_DELTA, pulse_delta))   # Strict 0-6 px bound
@@ -532,35 +657,59 @@ def _draw_speed_bar(
     bar_h: int = 17,
 ) -> None:
     """
-    Horizontal gradient speed bar: Green (0%) -> Yellow (50%) -> Red (100%).
-    Each vertical scan-line is coloured individually for a smooth gradient;
-    this is the only pixel-level loop in the entire script and covers at most
-    ~205 iterations — negligible CPU cost.
+    Horizontal speed bar — handles three states:
+
+      speed > 0  : Green -> Yellow -> Red gradient (forward throttle)
+      speed == 0 : Empty dark track (stopped)
+      speed < 0  : Solid amber fill from the left (reverse gear)
+
+    The reverse bar shows a flat colour (not a gradient) to visually
+    distinguish it from the forward throttle at a glance.
+    Only ~205 scan-line iterations in the worst case — negligible CPU cost.
     """
+    # Track background (always drawn)
     cv2.rectangle(frame, (x, y), (x + bar_w, y + bar_h), (22, 22, 22), -1)
     cv2.rectangle(frame, (x, y), (x + bar_w, y + bar_h), (75, 75, 75), 1)
 
-    if speed <= 0:
+    if speed == 0:
         return
 
-    fill_px = max(1, int(bar_w * speed / 100))
-
-    for i in range(fill_px):
-        norm = i / max(bar_w - 1, 1)          # 0.0 -> 1.0 across full bar width
-        if norm < 0.5:
-            r = int(norm * 2 * 255)
-            g = 255
-        else:
-            r = 255
-            g = int((1.0 - (norm - 0.5) * 2) * 255)
-        cv2.line(frame, (x + i, y + 1), (x + i, y + bar_h - 1), (0, g, r), 1)
-
-    # Percentage label to the right of the bar
-    cv2.putText(
-        frame, f"{speed}%",
-        (x + bar_w + 7, y + bar_h - 2),
-        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (195, 195, 195), 1, cv2.LINE_AA,
-    )
+    if speed < 0:
+        # ── REVERSE: Solid amber/orange bar ───────────────────────────────────
+        # abs(REVERSE_SPEED) = 40, so the bar fills 40 % from the left edge.
+        # The amber colour (BGR: 0, 140, 230 ≈ orange) matches the NEON_AMB
+        # family used on the reverse reticle and steering line for consistency.
+        fill_px = max(1, int(bar_w * abs(speed) / 100))
+        cv2.rectangle(
+            frame,
+            (x + 1, y + 1),
+            (x + fill_px - 1, y + bar_h - 1),
+            (0, 140, 230),   # BGR orange-amber
+            -1,
+        )
+        # Label: shows the raw negative speed value so the user knows the magnitude
+        cv2.putText(
+            frame, f"REV {speed}",
+            (x + bar_w + 7, y + bar_h - 2),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 165, 255), 1, cv2.LINE_AA,
+        )
+    else:
+        # ── FORWARD: Green -> Yellow -> Red gradient ───────────────────────────
+        fill_px = max(1, int(bar_w * speed / 100))
+        for i in range(fill_px):
+            norm = i / max(bar_w - 1, 1)          # 0.0 -> 1.0 across full bar width
+            if norm < 0.5:
+                r = int(norm * 2 * 255)
+                g = 255
+            else:
+                r = 255
+                g = int((1.0 - (norm - 0.5) * 2) * 255)
+            cv2.line(frame, (x + i, y + 1), (x + i, y + bar_h - 1), (0, g, r), 1)
+        cv2.putText(
+            frame, f"{speed}%",
+            (x + bar_w + 7, y + bar_h - 2),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (195, 195, 195), 1, cv2.LINE_AA,
+        )
 
 
 def _draw_orientation_dial(
@@ -667,8 +816,16 @@ def draw_hud(
              (48, 48, 48), 1)
 
     # ── Command label ─────────────────────────────────────────────────────────
-    # Red for emergency stop; neon green for all other active states
-    cmd_color = (40, 40, 240) if fist else (0, 255, 130)
+    # Color coding:
+    #   Emergency Stop → bright red       (danger, motor forced off)
+    #   Reverse *      → amber/orange     (caution, moving backward)
+    #   Forward / Stop → neon green       (normal operating state)
+    if fist:
+        cmd_color = (40, 40, 240)              # BGR bright red
+    elif command.startswith("REVERSE"):
+        cmd_color = (0, 140, 230)              # BGR amber/orange (matches REV bar)
+    else:
+        cmd_color = (0, 255, 130)              # BGR neon green (FORWARD / STOP)
     cv2.putText(frame, command,
                 (HUD_X + 10, HUD_Y + 52),
                 cv2.FONT_HERSHEY_DUPLEX, 0.63, cmd_color, 1, cv2.LINE_AA)
@@ -797,11 +954,13 @@ def draw_watermark(frame: np.ndarray, cinematic_mode: bool) -> None:
 # ==============================================================================
 def main() -> None:
     log.info("=" * 64)
-    log.info("  Virtual Joystick - Hand Gesture Controller")
-    log.info(f"  Target ESP : {ESP_IP}:{ESP_PORT}")
-    log.info(f"  Camera     : index {CAMERA_INDEX}  @  {TARGET_FPS} FPS cap")
-    log.info(f"  UDP rate   : {UDP_RATE_HZ} Hz  |  EMA alpha : {EMA_ALPHA}")
-    log.info("  Keyboard   : [Q] Quit | [M] Mute | [R] Cinematic")
+    log.info("  Virtual Joystick - Hand Gesture Controller  v3")
+    log.info(f"  Target ESP    : {ESP_IP}:{ESP_PORT}")
+    log.info(f"  Camera        : index {CAMERA_INDEX}  @  {TARGET_FPS} FPS cap")
+    log.info(f"  UDP rate      : {UDP_RATE_HZ} Hz  |  EMA alpha : {EMA_ALPHA}")
+    log.info(f"  Reverse speed : S{REVERSE_SPEED}  (palm-down gesture)")
+    log.info("  Keyboard      : [Q] Quit | [M] Mute | [R] Cinematic")
+    log.info("  Gestures      : Open hand=drive  Fist=E-Stop  PalmDown=Reverse")
     log.info("=" * 64)
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -894,6 +1053,7 @@ def main() -> None:
             # ── Gesture Computation + EMA Smoothing ───────────────────────────
             hand_visible  = False
             fist_detected = False
+            palm_down     = False
             lm            = None
 
             if results.multi_hand_landmarks:
@@ -910,33 +1070,43 @@ def main() -> None:
                 )
 
                 fist_detected = is_fist(lm)
+                # Palm-down is only meaningful when the hand is NOT a fist;
+                # a closed fist always takes Emergency Stop priority.
+                palm_down = is_palm_down(lm) and not fist_detected
 
                 if fist_detected:
+                    # Emergency Stop: zero everything immediately
                     raw_speed, raw_tilt = 0.0, 0.0
+                elif palm_down:
+                    # Reverse Gear: fixed negative speed, but steer normally
+                    raw_speed = float(REVERSE_SPEED)   # e.g. -40.0
+                    raw_tilt  = compute_tilt(lm)
                 else:
+                    # Normal forward drive: proportional speed + tilt
                     raw_speed = compute_speed(lm)
                     raw_tilt  = compute_tilt(lm)
 
-                # Apply EMA: smooth the values to eliminate jitter
+                # Apply EMA smoothing to suppress jitter
                 smooth_speed = ema_speed.update(raw_speed)
                 smooth_tilt  = ema_tilt.update(raw_tilt)
             else:
-                # No hand detected: feed zeros so EMA decays gracefully toward 0
+                # No hand: EMA decays toward 0 gracefully (avoids abrupt stop jump)
                 smooth_speed = ema_speed.update(0.0)
                 smooth_tilt  = ema_tilt.update(0.0)
 
-            # Quantize smoothed floats to integers
+            # Quantize smoothed floats to integers for UDP and HUD
             speed = int(smooth_speed)
             tilt  = int(smooth_tilt)
 
-            # Apply dead zones AFTER smoothing (prevents micro-jitter from
-            # toggling commands while near the dead zone boundary)
-            if speed < SPEED_DEAD_ZONE:
+            # Apply dead zones AFTER smoothing.
+            # NOTE: Dead zone is symmetric — catches small negatives too,
+            # so EMA-transition noise near 0 doesn't trigger spurious REVERSE.
+            if -SPEED_DEAD_ZONE < speed < SPEED_DEAD_ZONE:
                 speed = 0
             if abs(tilt) < TILT_DEAD_ZONE:
                 tilt = 0
 
-            # Override: fist always forces stop regardless of smoothed values
+            # Hard override: fist always forces full stop regardless of EMA state
             if fist_detected:
                 speed, tilt = 0, 0
 
