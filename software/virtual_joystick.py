@@ -1,18 +1,14 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║          VIRTUAL JOYSTICK — Hand Gesture Robot Car Controller                ║
-║                      Laptop-Side UDP Controller                              ║
+║        VIRTUAL JOYSTICK - Hand Gesture Robot Car Controller                  ║
+║        A passion project by Nomun                                            ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
-║  Architecture:                                                               ║
-║    Thread 1 (Main)  : Camera capture, OpenCV GUI, MediaPipe (30 FPS cap)    ║
-║    Thread 2 (Audio) : Queue-based pyttsx3 TTS — never blocks video feed     ║
-║    Thread 3 (UDP)   : Continuous 20 Hz heartbeat stream to ESP module       ║
+║  Thread 1 (Main)  : Camera, MediaPipe, OpenCV GUI  @ 30 FPS cap             ║
+║  Thread 2 (Audio) : Queue-based pyttsx3 with smart trend debouncing         ║
+║  Thread 3 (UDP)   : 20 Hz heartbeat stream to ESP module                    ║
 ║                                                                              ║
-║  UDP Payload Format : S[Speed]T[Tilt]  →  e.g. "S85T-12"                   ║
-║  Gesture Controls   : Open hand = move, thumb-index gap = speed,            ║
-║                        hand tilt = steering, fist = emergency stop           ║
-║  Keyboard Controls  : [Q] Quit   |   [M] Mute / Unmute audio                ║
+║  Keyboard:  [Q] Quit  |  [M] Mute/Unmute  |  [R] Toggle Cinematic Mode     ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
@@ -24,6 +20,7 @@ import queue
 import socket
 import logging
 import threading
+import collections
 
 # ── Third-Party ───────────────────────────────────────────────────────────────
 import cv2
@@ -33,44 +30,68 @@ import pyttsx3
 
 
 # ==============================================================================
-# ██████  SECTION 1 — CONFIGURATION
+# SECTION 1 — CONFIGURATION
 # ==============================================================================
 
 # ─── Network ──────────────────────────────────────────────────────────────────
-ESP_IP   = "192.168.4.1"   # ← CHANGE: IP of your ESP module.
-#                                Use "192.168.4.1" for ESP in Access Point mode
-#                                or check your router DHCP table for station mode
-ESP_PORT = 4210             # ← CHANGE: UDP port your ESP firmware listens on
+ESP_IP   = "192.168.4.1"   # ESP Access-Point IP (or router-assigned IP)
+ESP_PORT = 4210             # UDP port your ESP firmware listens on
 
 # ─── Camera ───────────────────────────────────────────────────────────────────
-CAMERA_INDEX = 0            # 0 = default laptop webcam; increment for USB cameras
-TARGET_FPS   = 30           # Hard cap on the main camera loop (saves CPU)
+CAMERA_INDEX = 0
+TARGET_FPS   = 30
 
 # ─── UDP Heartbeat ────────────────────────────────────────────────────────────
-UDP_RATE_HZ  = 20                   # Transmit command 20 times per second
-UDP_INTERVAL = 1.0 / UDP_RATE_HZ   # 50 ms between packets
+UDP_RATE_HZ  = 20
+UDP_INTERVAL = 1.0 / UDP_RATE_HZ
 
 # ─── Gesture Tuning ───────────────────────────────────────────────────────────
-# These two ratios define the full speed range.
-# Ratio = dist(ThumbTip→IndexTip) / dist(Wrist→MiddleBase)
-# Pinch fully → ratio ≈ 0.10  (0% speed)
-# Fingers fully apart → ratio ≈ 1.30  (100% speed)
-SPEED_RATIO_MIN = 0.15     # Ratio below this → speed = 0
-SPEED_RATIO_MAX = 1.30     # Ratio above this → speed = 100 (clamped)
-SPEED_DEAD_ZONE = 5        # Speed % values < this are snapped to 0
-TILT_DEAD_ZONE  = 10       # Angles within ±10° are treated as "Straight"
+# Speed ratio: dist(ThumbTip→IndexTip) / dist(Wrist→MiddleBase)
+SPEED_RATIO_MIN = 0.15     # Fully pinched → 0 %
+SPEED_RATIO_MAX = 1.30     # Fingers fully spread → 100 %
+SPEED_DEAD_ZONE = 5        # Values below this snap to 0
+TILT_DEAD_ZONE  = 10       # Angles within ±10 deg treated as Straight
+
+# ─── EMA Smoothing ────────────────────────────────────────────────────────────
+# alpha=1.0 = no smoothing; alpha=0.1 = very heavy smoothing (more lag)
+EMA_ALPHA = 0.30
 
 # ─── HUD Layout ───────────────────────────────────────────────────────────────
-HUD_X, HUD_Y = 10, 10      # Top-left corner of the HUD panel (pixels)
-HUD_W, HUD_H = 330, 210    # Width × Height of the HUD panel
+HUD_X, HUD_Y = 10, 10
+HUD_W, HUD_H = 348, 220
 
-# ─── MediaPipe Confidence ─────────────────────────────────────────────────────
-MP_DETECT_CONF = 0.72      # Initial hand detection confidence threshold
-MP_TRACK_CONF  = 0.60      # Continuous tracking confidence threshold
+# ─── Iron Man Reticle ─────────────────────────────────────────────────────────
+RETICLE_BASE_R  = 10       # Base circle radius in pixels
+PULSE_MAX_DELTA = 6        # Maximum additional radius from speed pulse (0-6 px)
+
+# ─── Speed Trend Detection ────────────────────────────────────────────────────
+TREND_WINDOW    = 8        # Frames to accumulate for trend calculation
+TREND_THRESHOLD = 12       # Minimum speed-point delta to declare a trend
+
+# ─── MediaPipe ────────────────────────────────────────────────────────────────
+MP_DETECT_CONF = 0.72
+MP_TRACK_CONF  = 0.60
+
+# ─── Neon Color Palette (all values in OpenCV BGR order) ──────────────────────
+# Cyan family  — Throttle line + active reticle
+#   Pure cyan in BGR = (255, 255, 0).  We desaturate slightly for a warmer glow.
+NEON_CYAN_DARK  = ( 90,  90,   0)   # Outer glow (darkened)
+NEON_CYAN_MID   = (200, 200,  10)   # Mid halo
+NEON_CYAN_CORE  = (255, 255, 255)   # Bright white core
+
+# Amber / Orange family — Steering axis line
+NEON_AMB_DARK   = (  0,  55, 110)   # Outer glow (darkened)
+NEON_AMB_MID    = (  0, 140, 230)   # Mid halo
+NEON_AMB_CORE   = (  0, 200, 255)   # Bright core
+
+# Red family — Stop reticle
+NEON_RED_DARK   = (  0,   0,  80)   # Outer glow (darkened)
+NEON_RED_MID    = (  0,   0, 170)   # Mid halo
+NEON_RED_CORE   = ( 60,  60, 255)   # Bright red core
 
 
 # ==============================================================================
-# ██████  SECTION 2 — LOGGING SETUP
+# SECTION 2 — LOGGING
 # ==============================================================================
 logging.basicConfig(
     level=logging.INFO,
@@ -82,59 +103,85 @@ log = logging.getLogger(__name__)
 
 
 # ==============================================================================
-# ██████  SECTION 3 — SHARED STATE & SYNCHRONISATION PRIMITIVES
+# SECTION 3 — SHARED STATE
 # ==============================================================================
-# One lock protects the entire shared_state dictionary.
-# All threads read/write ONLY while holding this lock.
 state_lock = threading.Lock()
 
 shared_state: dict = {
-    "speed"      : 0,        # int  0–100 — current speed percentage
-    "tilt"       : 0,        # int  degrees, negative=left, positive=right
-    "command"    : "STOP",   # str  human-readable label for current action
-    "fist"       : False,    # bool emergency-stop flag (closed fist detected)
-    "running"    : True,     # bool set to False to signal all threads to exit
-    "muted"      : False,    # bool TTS mute toggle
-    "fps"        : 0.0,      # float measured main-thread FPS (display only)
-    "hand_visible": False,   # bool True when MediaPipe detects a hand
+    "speed"       : 0,       # int 0-100
+    "tilt"        : 0,       # int signed degrees (negative=left, positive=right)
+    "command"     : "STOP",  # str human-readable label
+    "fist"        : False,   # bool emergency-stop flag
+    "running"     : True,    # bool — set False to signal all threads to exit
+    "muted"       : False,   # bool TTS mute toggle
+    "fps"         : 0.0,     # float measured FPS (display only)
+    "hand_visible": False,   # bool
 }
 
-# Queue used to pass text to the Audio thread (maxsize prevents memory runaway)
-audio_queue: queue.Queue = queue.Queue(maxsize=6)
+audio_queue: queue.Queue = queue.Queue(maxsize=8)
 
 
 # ==============================================================================
-# ██████  SECTION 4 — THREAD 2: AUDIO (pyttsx3 — non-blocking TTS)
+# SECTION 4 — EMA FILTER
+# ==============================================================================
+class EMAFilter:
+    """
+    Exponential Moving Average filter.
+    Smooths raw gesture values to prevent hardware jitter from
+    causing command oscillation or choppy speed bars.
+
+    Formula:  value_t = alpha * raw_t + (1 - alpha) * value_(t-1)
+    """
+
+    def __init__(self, alpha: float = EMA_ALPHA):
+        self.alpha  = alpha
+        self._value = None      # None until first observation
+
+    def update(self, raw: float) -> float:
+        """Feed a new raw value; returns the smoothed output."""
+        if self._value is None:
+            self._value = float(raw)
+        else:
+            self._value = self.alpha * raw + (1.0 - self.alpha) * self._value
+        return self._value
+
+    def reset(self) -> None:
+        """Forget history (e.g. when the hand disappears)."""
+        self._value = None
+
+    @property
+    def value(self) -> float:
+        return self._value if self._value is not None else 0.0
+
+
+# ==============================================================================
+# SECTION 5 — THREAD 2: AUDIO (pyttsx3, queue-based, never blocks video)
 # ==============================================================================
 def audio_thread_fn() -> None:
     """
-    Dedicated TTS thread.  Consumes text items from `audio_queue` and
-    speaks them via pyttsx3.  A `None` sentinel shuts the thread down.
-
-    By isolating pyttsx3 in its own thread we guarantee that
-    `engine.runAndWait()` — which is blocking — never stalls the video feed.
+    Consumes text items from `audio_queue` and speaks them.
+    A `None` sentinel value signals clean shutdown.
+    pyttsx3.runAndWait() is blocking, so we isolate it here.
     """
     try:
         engine = pyttsx3.init()
-        engine.setProperty("rate",   160)   # words per minute (150–180 = natural)
-        engine.setProperty("volume", 1.0)   # 0.0–1.0
-        log.info("pyttsx3 engine initialised successfully.")
+        engine.setProperty("rate",   155)
+        engine.setProperty("volume", 1.0)
+        log.info("pyttsx3 engine initialized.")
     except Exception as exc:
-        log.error(f"pyttsx3 init failed: {exc}  —  Audio thread will not run.")
-        # Mark audio thread as gone but don't crash the program
+        log.error(f"pyttsx3 init failed: {exc}  -  Audio thread will not run.")
         return
 
     while True:
         try:
-            # Block with a timeout so we can periodically check `running`
             text = audio_queue.get(timeout=0.5)
         except queue.Empty:
             with state_lock:
                 if not shared_state["running"]:
-                    break       # Main thread has set running=False → clean exit
+                    break
             continue
 
-        if text is None:        # Sentinel value sent by main thread at shutdown
+        if text is None:                   # Shutdown sentinel
             audio_queue.task_done()
             break
 
@@ -146,7 +193,6 @@ def audio_thread_fn() -> None:
                 engine.say(text)
                 engine.runAndWait()
             except RuntimeError as exc:
-                # runAndWait can raise if the engine loop is already running
                 log.warning(f"TTS RuntimeError (ignored): {exc}")
             except Exception as exc:
                 log.warning(f"TTS error: {exc}")
@@ -157,43 +203,37 @@ def audio_thread_fn() -> None:
 
 
 def announce(text: str) -> None:
-    """
-    Non-blocking helper — pushes `text` onto the audio queue.
-    Silently drops the message if the queue is already full.
-    """
+    """Non-blocking push to the audio queue. Drops silently when full."""
     try:
         audio_queue.put_nowait(text)
     except queue.Full:
-        pass   # Better to drop an announcement than to block the main loop
+        pass
 
 
 # ==============================================================================
-# ██████  SECTION 5 — THREAD 3: UDP COMMUNICATION (20 Hz heartbeat)
+# SECTION 6 — THREAD 3: UDP COMMUNICATION (20 Hz heartbeat)
 # ==============================================================================
 def udp_thread_fn() -> None:
     """
-    Transmits the current command as a UDP datagram to the ESP module at
-    exactly UDP_RATE_HZ (20 Hz).  This continuous stream serves as the
-    hardware heartbeat: if the laptop dies the ESP stops receiving packets
-    and can implement its own timeout/failsafe.
+    Transmits the current command state to the ESP at UDP_RATE_HZ (20 Hz).
+    The continuous stream acts as a hardware heartbeat:
+    if the laptop dies the ESP can detect packet loss and apply a failsafe.
 
-    Payload format (Option C):  S[Speed]T[Tilt]
-      Speed : integer 0–100
-      Tilt  : signed integer, negative = left, positive = right
+    Payload format: S[Speed]T[Tilt]
     Examples:
-      "S85T-12"   →  85% speed, 12° left tilt
-      "S0T0"      →  stopped, straight
-      "S100T30"   →  full speed, 30° right tilt
+        "S85T-12"  — 85% speed, 12 deg left
+        "S0T0"     — stopped / straight
+        "S100T30"  — full speed, 30 deg right
     """
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(0.05)   # Non-blocking enough; sendto on UDP rarely blocks
-        log.info(f"UDP socket created. Target: {ESP_IP}:{ESP_PORT}")
+        sock.settimeout(0.05)
+        log.info(f"UDP socket created.  Target: {ESP_IP}:{ESP_PORT}")
     except OSError as exc:
-        log.error(f"Cannot create UDP socket: {exc}  —  UDP thread exiting.")
+        log.error(f"Cannot create UDP socket: {exc}  -  UDP thread exiting.")
         return
 
-    last_payload_logged = ""
+    last_payload = ""
 
     while True:
         tick_start = time.perf_counter()
@@ -204,21 +244,19 @@ def udp_thread_fn() -> None:
             speed = shared_state["speed"]
             tilt  = shared_state["tilt"]
 
-        # Build payload string
+        # Format: S[Speed]T[Tilt]  (tilt is already signed, e.g. -12 or +30)
         payload = f"S{speed}T{tilt}"
 
         try:
             sock.sendto(payload.encode("utf-8"), (ESP_IP, ESP_PORT))
-            # Only log when the payload actually changes (avoids log spam)
-            if payload != last_payload_logged:
-                log.debug(f"UDP TX → {payload}")
-                last_payload_logged = payload
+            if payload != last_payload:
+                log.debug(f"UDP TX -> {payload}")
+                last_payload = payload
         except OSError as exc:
             log.warning(f"UDP send error (will retry): {exc}")
 
-        # ── Precise rate control: sleep for the remainder of the 50 ms window ──
-        elapsed    = time.perf_counter() - tick_start
-        sleep_for  = UDP_INTERVAL - elapsed
+        elapsed   = time.perf_counter() - tick_start
+        sleep_for = UDP_INTERVAL - elapsed
         if sleep_for > 0:
             time.sleep(sleep_for)
 
@@ -230,9 +268,8 @@ def udp_thread_fn() -> None:
 
 
 # ==============================================================================
-# ██████  SECTION 6 — GESTURE PROCESSING (pure functions, main thread only)
+# SECTION 7 — GESTURE PROCESSING (pure functions)
 # ==============================================================================
-
 def _dist(a, b) -> float:
     """Euclidean distance between two MediaPipe NormalizedLandmark objects."""
     return math.hypot(a.x - b.x, a.y - b.y)
@@ -240,78 +277,44 @@ def _dist(a, b) -> float:
 
 def is_fist(lm: list) -> bool:
     """
-    Emergency-stop detector.  Returns True when ALL four fingers are curled.
-
-    Logic: in image-space y increases downward.  When a finger is curled, its
-    tip (e.g. landmark 8) will have a HIGHER y value than its proximal
-    inter-phalangeal (PIP) joint (e.g. landmark 6).  We test all four fingers.
-
-    Finger landmark pairs  (Tip index, PIP index):
-        Index  → (8,  6)
-        Middle → (12, 10)
-        Ring   → (16, 14)
-        Pinky  → (20, 18)
+    Returns True when all four fingers are curled (emergency stop).
+    In image space, y increases downward; a curled finger tip sits
+    below (higher y than) its PIP joint.
+    Pairs: (Tip, PIP)  →  Index(8,6), Middle(12,10), Ring(16,14), Pinky(20,18)
     """
-    finger_pairs = [(8, 6), (12, 10), (16, 14), (20, 18)]
-    return all(lm[tip].y > lm[pip].y for tip, pip in finger_pairs)
+    return all(lm[tip].y > lm[pip].y for tip, pip in [(8,6),(12,10),(16,14),(20,18)])
 
 
-def compute_speed(lm: list) -> int:
+def compute_speed(lm: list) -> float:
     """
-    Proportional speed from pinch aperture.
-
-    1. Measure dist(ThumbTip[4] → IndexTip[8]).
-    2. Normalise by the stable anatomical reference dist(Wrist[0] → MiddleBase[9]).
-       This makes the measurement hand-size-independent and robust to camera zoom.
-    3. Map the resulting ratio to 0–100, clamped at SPEED_RATIO_MIN/MAX.
-    4. Apply SPEED_DEAD_ZONE: values < threshold snap to 0.
-
-    Returns: integer in range [0, 100].
+    Proportional speed (0.0–100.0) from pinch aperture.
+    Normalized against the anatomical reference Wrist[0]→MiddleBase[9]
+    to be hand-size and camera-distance independent.
+    Returns a float; EMA and dead-zone quantization happen in the main loop.
     """
-    thumb_idx_dist    = _dist(lm[4], lm[8])
-    wrist_mid_dist    = _dist(lm[0], lm[9])
-
-    if wrist_mid_dist < 1e-6:          # Guard against division by zero
-        return 0
-
-    ratio         = thumb_idx_dist / wrist_mid_dist
-    ratio_clamped = max(SPEED_RATIO_MIN, min(SPEED_RATIO_MAX, ratio))
-
-    speed = int(
-        (ratio_clamped - SPEED_RATIO_MIN)
-        / (SPEED_RATIO_MAX - SPEED_RATIO_MIN)
-        * 100
-    )
-    return speed if speed >= SPEED_DEAD_ZONE else 0
+    thumb_idx = _dist(lm[4], lm[8])
+    wrist_mid = _dist(lm[0], lm[9])
+    if wrist_mid < 1e-6:
+        return 0.0
+    ratio = max(SPEED_RATIO_MIN, min(SPEED_RATIO_MAX, thumb_idx / wrist_mid))
+    raw   = (ratio - SPEED_RATIO_MIN) / (SPEED_RATIO_MAX - SPEED_RATIO_MIN) * 100.0
+    return raw if raw >= SPEED_DEAD_ZONE else 0.0
 
 
-def compute_tilt(lm: list) -> int:
+def compute_tilt(lm: list) -> float:
     """
-    Hand tilt angle for left/right steering.
-
-    The vector from Wrist[0] → MiddleFingerBase[9] defines the hand's
-    longitudinal axis.  We measure its deviation from vertical (pointing up).
-
-    Convention (matching a natural steering motion):
-        Tilt left  (anti-clockwise in screen)  → negative degrees
-        Tilt right (clockwise in screen)       → positive degrees
-        ±TILT_DEAD_ZONE                        → forced to 0° (Straight)
-
-    Returns: signed integer degrees.
+    Hand tilt angle (degrees) for steering.
+    Vector: Wrist[0] → MiddleFingerBase[9], deviation from vertical.
+    Negative = left lean, Positive = right lean.
+    Returns float; dead zone applied after EMA in main loop.
     """
-    dx =  lm[9].x - lm[0].x     # Positive = wrist moved right of middle base
-    dy = -(lm[9].y - lm[0].y)   # Flip y because image-space y is inverted
-
-    angle_deg = int(math.degrees(math.atan2(dx, dy)))
-
-    return 0 if abs(angle_deg) < TILT_DEAD_ZONE else angle_deg
+    dx =  lm[9].x - lm[0].x
+    dy = -(lm[9].y - lm[0].y)   # Flip: image y is inverted vs. Cartesian y
+    return math.degrees(math.atan2(dx, dy))
 
 
 def classify_command(speed: int, tilt: int, fist: bool) -> str:
-    """
-    Maps numeric state to a human-readable command label used for
-    announcements and HUD display.
-    """
+    """Maps numeric state to a human-readable command label."""
     if fist:
         return "EMERGENCY STOP"
     if speed == 0:
@@ -324,347 +327,580 @@ def classify_command(speed: int, tilt: int, fist: bool) -> str:
 
 
 # ==============================================================================
-# ██████  SECTION 7 — HUD DRAWING (OpenCV, main thread only)
+# SECTION 8 — SMART AUDIO DEBOUNCER
 # ==============================================================================
+class SmartDebouncer:
+    """
+    Intelligent TTS state tracker with trend detection.
 
+    Announces:
+      - Every DISTINCT command state change (STOP, FORWARD, etc.)
+        including EMERGENCY STOP
+      - "Accelerating" once when speed consistently rises over several frames
+      - "Slowing down" once when speed consistently falls over several frames
+    Never re-announces the same state; never spams raw speed numbers.
+    """
+
+    _SPEECH_MAP = {
+        "STOP"           : "Stopped",
+        "FORWARD"        : "Moving forward",
+        "FORWARD LEFT"   : "Turning left",
+        "FORWARD RIGHT"  : "Turning right",
+        "EMERGENCY STOP" : "Emergency stop",
+    }
+
+    def __init__(self):
+        self._last_command  = ""
+        self._last_trend    = ""          # "up", "down", or ""
+        self._speed_history = collections.deque(maxlen=TREND_WINDOW)
+
+    def update(self, command: str, speed: int) -> None:
+        # ── 1. Command change ─────────────────────────────────────────────────
+        if command != self._last_command:
+            speech = self._SPEECH_MAP.get(command, command.lower())
+            announce(speech)
+            log.info(f"[Audio] '{speech}'  ({self._last_command!r} -> {command!r})")
+            self._last_command = command
+            # Reset trend state on every command change to avoid stale history
+            self._last_trend = ""
+            self._speed_history.clear()
+            return   # Don't also check trend in the same frame as a command change
+
+        # ── 2. Speed trend (only while actively driving) ───────────────────────
+        if command in ("FORWARD", "FORWARD LEFT", "FORWARD RIGHT"):
+            self._speed_history.append(speed)
+            if len(self._speed_history) >= TREND_WINDOW:
+                delta = int(self._speed_history[-1]) - int(self._speed_history[0])
+                if delta > TREND_THRESHOLD:
+                    current_trend = "up"
+                elif delta < -TREND_THRESHOLD:
+                    current_trend = "down"
+                else:
+                    current_trend = ""      # Plateau — trend has levelled off
+
+                if current_trend and current_trend != self._last_trend:
+                    speech = "Accelerating" if current_trend == "up" else "Slowing down"
+                    announce(speech)
+                    log.info(f"[Audio] '{speech}'  (speed delta = {delta:+d})")
+                    self._last_trend = current_trend
+                elif not current_trend:
+                    # Once a trend levels off, allow it to fire again later
+                    self._last_trend = ""
+        else:
+            # Not actively driving: clear history so stale values don't pollute
+            self._speed_history.clear()
+            self._last_trend = ""
+
+
+# ==============================================================================
+# SECTION 9 — IRON MAN NEON VISUALS
+# ==============================================================================
+def _neon_line(
+    frame: np.ndarray,
+    pt1: tuple, pt2: tuple,
+    dark_bgr: tuple, mid_bgr: tuple, core_bgr: tuple,
+    outer_thick: int = 9,
+    mid_thick: int   = 5,
+    core_thick: int  = 2,
+) -> None:
+    """
+    Neon glow line via triple-layer stacking (fast, no extra frame copies).
+
+    Layer 1 — Wide outer glow:   thick line in a dark, saturated color
+    Layer 2 — Mid halo:          medium line at full glow brightness
+    Layer 3 — Bright core:       thin line in white or near-white
+
+    The visual illusion of soft bloom comes from each layer being drawn
+    centered on the previous, progressively brighter and thinner.
+    """
+    cv2.line(frame, pt1, pt2, dark_bgr, outer_thick, cv2.LINE_AA)
+    cv2.line(frame, pt1, pt2, mid_bgr,  mid_thick,   cv2.LINE_AA)
+    cv2.line(frame, pt1, pt2, core_bgr, core_thick,  cv2.LINE_AA)
+
+
+def _neon_circle(
+    frame: np.ndarray,
+    center: tuple, radius: int,
+    dark_bgr: tuple, mid_bgr: tuple, core_bgr: tuple,
+    filled: bool      = False,
+    outer_thick: int  = 6,
+    core_thick: int   = 2,
+) -> None:
+    """
+    Neon glow circle via triple-layer stacking.
+    `filled=True` draws a solid disc (for STOP state).
+    `filled=False` draws a hollow ring (for GO/active state).
+    """
+    fill = -1 if filled else core_thick
+    cv2.circle(frame, center, radius + 5, dark_bgr, outer_thick,     cv2.LINE_AA)
+    cv2.circle(frame, center, radius + 2, mid_bgr,  outer_thick - 2, cv2.LINE_AA)
+    cv2.circle(frame, center, radius,     core_bgr, fill,            cv2.LINE_AA)
+
+
+def draw_iron_man_visuals(
+    frame: np.ndarray,
+    lm: list,
+    speed: int,
+    frame_w: int,
+    frame_h: int,
+) -> None:
+    """
+    Renders all Iron Man-style neon geometry on top of the MediaPipe skeleton.
+    Called in BOTH control mode and cinematic mode.
+
+    Elements:
+      1. Throttle line  — Thumb[4] -> Index[8]         (Cyan neon)
+      2. Steering line  — Wrist[0] -> MiddleBase[9]    (Amber neon)
+      3. State-reactive reticle at the throttle midpoint
+
+    Performance note: uses only standard cv2.line and cv2.circle (no shaders,
+    no per-pixel loops). All anti-aliasing is done by OpenCV's LINE_AA flag.
+    """
+    def px(i: int) -> tuple:
+        """Convert a normalized landmark to integer pixel coordinates."""
+        return (int(lm[i].x * frame_w), int(lm[i].y * frame_h))
+
+    thumb_tip = px(4)
+    index_tip = px(8)
+    wrist     = px(0)
+    mid_base  = px(9)
+
+    # ── 1. Throttle Line: Thumb[4] -> Index[8]  (Cyan) ───────────────────────
+    _neon_line(
+        frame, thumb_tip, index_tip,
+        dark_bgr=NEON_CYAN_DARK, mid_bgr=NEON_CYAN_MID, core_bgr=NEON_CYAN_CORE,
+        outer_thick=9, mid_thick=5, core_thick=2,
+    )
+
+    # ── 2. Steering Line: Wrist[0] -> MiddleBase[9]  (Amber, more subtle) ────
+    # Thinner than the throttle line so it doesn't overwhelm the skeleton.
+    _neon_line(
+        frame, wrist, mid_base,
+        dark_bgr=NEON_AMB_DARK, mid_bgr=NEON_AMB_MID, core_bgr=NEON_AMB_CORE,
+        outer_thick=6, mid_thick=3, core_thick=2,
+    )
+
+    # ── 3. State-Reactive Reticle at Throttle Midpoint ───────────────────────
+    mid_x  = (thumb_tip[0] + index_tip[0]) // 2
+    mid_y  = (thumb_tip[1] + index_tip[1]) // 2
+    center = (mid_x, mid_y)
+
+    label_x_offset = RETICLE_BASE_R + 8    # Text starts just to the right
+
+    if speed == 0:
+        # ── STOPPED: Solid red disc ───────────────────────────────────────────
+        _neon_circle(
+            frame, center, RETICLE_BASE_R,
+            dark_bgr=NEON_RED_DARK, mid_bgr=NEON_RED_MID, core_bgr=NEON_RED_CORE,
+            filled=True, outer_thick=5, core_thick=-1,
+        )
+        # Accessibility label "STOP" for color-blind users
+        cv2.putText(
+            frame, "STOP",
+            (mid_x + label_x_offset, mid_y + 5),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.40, NEON_RED_CORE, 1, cv2.LINE_AA,
+        )
+    else:
+        # ── ACTIVE: Hollow cyan ring with speed-driven pulse ──────────────────
+        # Oscillation: sin wave at ~2 Hz (4 rad/s), amplitude scaled by speed
+        oscillation = 0.5 + 0.5 * math.sin(time.time() * 4.0)   # 0.0 -> 1.0
+        pulse_delta = int(oscillation * PULSE_MAX_DELTA * (speed / 100.0))
+        pulse_delta = max(0, min(PULSE_MAX_DELTA, pulse_delta))   # Strict 0-6 px bound
+
+        active_r = RETICLE_BASE_R + pulse_delta
+        _neon_circle(
+            frame, center, active_r,
+            dark_bgr=NEON_CYAN_DARK, mid_bgr=NEON_CYAN_MID, core_bgr=NEON_CYAN_CORE,
+            filled=False, outer_thick=5, core_thick=2,
+        )
+        # Accessibility label "GO"
+        cv2.putText(
+            frame, "GO",
+            (mid_x + active_r + 8, mid_y + 5),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.40, NEON_CYAN_CORE, 1, cv2.LINE_AA,
+        )
+
+
+# ==============================================================================
+# SECTION 10 — HUD DRAWING (control mode only)
+# ==============================================================================
 def _draw_speed_bar(
     frame: np.ndarray,
     speed: int,
     x: int, y: int,
-    bar_w: int = 200,
-    bar_h: int = 18,
+    bar_w: int = 205,
+    bar_h: int = 17,
 ) -> None:
     """
-    Horizontal gradient speed bar: Green (0%) → Yellow (50%) → Red (100%).
-
-    Implementation note: we draw individual vertical scan lines so the
-    gradient is rendered mathematically rather than relying on OpenCV
-    gradient APIs (which don't exist in the drawing module).
+    Horizontal gradient speed bar: Green (0%) -> Yellow (50%) -> Red (100%).
+    Each vertical scan-line is coloured individually for a smooth gradient;
+    this is the only pixel-level loop in the entire script and covers at most
+    ~205 iterations — negligible CPU cost.
     """
-    # ── Background track ──
-    cv2.rectangle(frame, (x, y), (x + bar_w, y + bar_h), (30, 30, 30), -1)
-    cv2.rectangle(frame, (x, y), (x + bar_w, y + bar_h), (90, 90, 90), 1)
+    cv2.rectangle(frame, (x, y), (x + bar_w, y + bar_h), (22, 22, 22), -1)
+    cv2.rectangle(frame, (x, y), (x + bar_w, y + bar_h), (75, 75, 75), 1)
 
     if speed <= 0:
         return
 
-    fill_pixels = max(1, int(bar_w * speed / 100))
+    fill_px = max(1, int(bar_w * speed / 100))
 
-    for i in range(fill_pixels):
-        norm = i / max(bar_w - 1, 1)   # 0.0 → 1.0 across the full bar width
+    for i in range(fill_px):
+        norm = i / max(bar_w - 1, 1)          # 0.0 -> 1.0 across full bar width
         if norm < 0.5:
-            # Green (0,255,0) → Yellow (0,255,255) in BGR
             r = int(norm * 2 * 255)
             g = 255
         else:
-            # Yellow → Red (0,0,255) in BGR
             r = 255
             g = int((1.0 - (norm - 0.5) * 2) * 255)
-        b = 0
-        cv2.line(frame, (x + i, y + 1), (x + i, y + bar_h - 1), (b, g, r), 1)
+        cv2.line(frame, (x + i, y + 1), (x + i, y + bar_h - 1), (0, g, r), 1)
 
-    # ── Speed percentage label to the right of the bar ──
+    # Percentage label to the right of the bar
     cv2.putText(
         frame, f"{speed}%",
-        (x + bar_w + 6, y + bar_h - 2),
-        cv2.FONT_HERSHEY_SIMPLEX, 0.48, (210, 210, 210), 1, cv2.LINE_AA,
+        (x + bar_w + 7, y + bar_h - 2),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (195, 195, 195), 1, cv2.LINE_AA,
     )
 
 
-def _draw_orientation_horizon(
+def _draw_orientation_dial(
     frame: np.ndarray,
     tilt_deg: int,
     cx: int, cy: int,
-    radius: int = 52,
+    radius: int = 50,
 ) -> None:
     """
-    Aviation-style artificial horizon (attitude indicator).
+    Aviation-style attitude indicator (artificial horizon).
 
-    Elements:
-        • Outer reference circle with degree tick marks at ±30°, ±60°, ±90°.
-        • Fixed aircraft-symbol crosshair at centre.
-        • Rotating needle indicating the current hand tilt.
-          - Cyan   = straight (within dead zone)
-          - Red    = tilting left
-          - Green  = tilting right
-
-    Angle convention: 0° points straight UP on screen (−90° in OpenCV polar
-    coordinates where 0° = right).  We rotate by −90° to achieve this.
+    IMPORTANT: Degree symbol deliberately avoided here.
+    Uses the text 'deg' suffix to prevent OpenCV font rendering artifacts
+    that can occur with Unicode/extended ASCII characters on some platforms.
     """
-    # ── Outer ring ──
-    cv2.circle(frame, (cx, cy), radius, (70, 70, 70), 1, cv2.LINE_AA)
+    # Outer reference ring
+    cv2.circle(frame, (cx, cy), radius, (60, 60, 60), 1, cv2.LINE_AA)
 
-    # ── Degree tick marks ──
-    for tick in [-90, -60, -30, 0, 30, 60, 90]:
-        # Convert conceptual angle (0°=up) to OpenCV's polar angle (0°=right)
-        rad        = math.radians(tick - 90)
-        outer_x    = int(cx + radius * math.cos(rad))
-        outer_y    = int(cy + radius * math.sin(rad))
-        inner_len  = radius - (12 if tick % 90 == 0 else (8 if tick % 30 == 0 else 5))
-        inner_x    = int(cx + inner_len * math.cos(rad))
-        inner_y    = int(cy + inner_len * math.sin(rad))
-        tick_color = (130, 130, 130) if tick == 0 else (80, 80, 80)
-        cv2.line(frame, (inner_x, inner_y), (outer_x, outer_y), tick_color, 1, cv2.LINE_AA)
+    # Tick marks at every 30 deg from -90 to +90
+    for tick in (-90, -60, -30, 0, 30, 60, 90):
+        # We map 0 deg (upward) to OpenCV's -90 deg (pointing up in image space)
+        rad      = math.radians(tick - 90)
+        ox       = int(cx + radius * math.cos(rad))
+        oy       = int(cy + radius * math.sin(rad))
+        tick_len = 12 if tick % 90 == 0 else 7
+        inner_r  = radius - tick_len
+        ix       = int(cx + inner_r * math.cos(rad))
+        iy       = int(cy + inner_r * math.sin(rad))
+        col      = (120, 120, 120) if tick == 0 else (65, 65, 65)
+        cv2.line(frame, (ix, iy), (ox, oy), col, 1, cv2.LINE_AA)
 
-    # Label key ticks
-    for label_deg, label_txt in [(-90, "L"), (90, "R"), (0, "")]:
-        if label_txt:
-            rad = math.radians(label_deg - 90)
-            lx  = int(cx + (radius + 10) * math.cos(rad))
-            ly  = int(cy + (radius + 10) * math.sin(rad)) + 4
-            cv2.putText(frame, label_txt, (lx - 5, ly),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.36, (100, 100, 100), 1, cv2.LINE_AA)
+    # L / R axis labels
+    for label_deg, label_txt in ((-90, "L"), (90, "R")):
+        rad = math.radians(label_deg - 90)
+        lx  = int(cx + (radius + 10) * math.cos(rad))
+        ly  = int(cy + (radius + 10) * math.sin(rad)) + 4
+        cv2.putText(frame, label_txt, (lx - 5, ly),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.34, (95, 95, 95), 1, cv2.LINE_AA)
 
-    # ── Fixed aircraft crosshair (the "aircraft" that the horizon moves under) ──
-    cv2.line(frame, (cx - 14, cy), (cx - 5, cy), (180, 180, 50), 2, cv2.LINE_AA)
-    cv2.line(frame, (cx + 5,  cy), (cx + 14, cy), (180, 180, 50), 2, cv2.LINE_AA)
-    cv2.circle(frame, (cx, cy), 3, (180, 180, 50), -1, cv2.LINE_AA)
+    # Fixed aircraft-crosshair symbol (the "aircraft" the horizon moves under)
+    cv2.line(frame, (cx - 14, cy), (cx - 5, cy), (160, 160, 35), 2, cv2.LINE_AA)
+    cv2.line(frame, (cx + 5,  cy), (cx + 14, cy), (160, 160, 35), 2, cv2.LINE_AA)
+    cv2.circle(frame, (cx, cy), 3, (160, 160, 35), -1, cv2.LINE_AA)
 
-    # ── Rotating needle ──
-    needle_rad  = math.radians(tilt_deg - 90)
-    needle_len  = radius - 5
-    tip_x       = int(cx + needle_len * math.cos(needle_rad))
-    tip_y       = int(cy + needle_len * math.sin(needle_rad))
+    # Rotating needle indicating current tilt
+    needle_rad = math.radians(tilt_deg - 90)
+    needle_len = radius - 5
+    tip_x      = int(cx + needle_len * math.cos(needle_rad))
+    tip_y      = int(cy + needle_len * math.sin(needle_rad))
 
     if abs(tilt_deg) <= TILT_DEAD_ZONE:
-        needle_color = (0, 240, 240)     # Cyan  → Straight
+        needle_col = (0, 220, 220)      # Cyan  -> Straight / dead zone
     elif tilt_deg < 0:
-        needle_color = (50, 50, 255)     # Red   → Left tilt
+        needle_col = (55, 55, 240)      # Red   -> Left tilt
     else:
-        needle_color = (50, 220, 50)     # Green → Right tilt
+        needle_col = (55, 210, 55)      # Green -> Right tilt
 
-    cv2.line(frame, (cx, cy), (tip_x, tip_y), needle_color, 2, cv2.LINE_AA)
-    cv2.circle(frame, (tip_x, tip_y), 4, needle_color, -1, cv2.LINE_AA)
+    cv2.line(frame, (cx, cy), (tip_x, tip_y), needle_col, 2, cv2.LINE_AA)
+    cv2.circle(frame, (tip_x, tip_y), 4, needle_col, -1, cv2.LINE_AA)
 
-    # ── Degree readout below the dial ──
-    sign_str = f"{tilt_deg:+d}°"
-    cv2.putText(frame, sign_str, (cx - 20, cy + radius + 14),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (170, 170, 170), 1, cv2.LINE_AA)
+    # Tilt readout below dial — uses 'deg' suffix, NO degree symbol
+    sign_str = f"+{tilt_deg} deg" if tilt_deg >= 0 else f"{tilt_deg} deg"
+    cv2.putText(frame, sign_str,
+                (cx - 28, cy + radius + 14),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.37, (150, 150, 150), 1, cv2.LINE_AA)
 
 
 def draw_hud(
-    frame:        np.ndarray,
-    speed:        int,
-    tilt:         int,
-    command:      str,
-    fps:          float,
-    muted:        bool,
-    fist:         bool,
+    frame: np.ndarray,
+    speed: int,
+    tilt:  int,
+    command: str,
+    fps: float,
+    muted: bool,
+    fist: bool,
     hand_visible: bool,
 ) -> None:
     """
-    Renders the complete professional HUD overlay onto `frame` in-place.
+    Full professional dashboard overlay.
+    Only called when cinematic_mode == False.
 
-    Layout (inside the semi-transparent panel):
-        ┌──────────────────────────────────┐
-        │  VIRTUAL JOYSTICK               │  ← title bar
-        │  FORWARD LEFT      (command)    │
-        │  SPEED ▓▓▓▓▓▓░░░░  72%          │  ← gradient bar
-        │                                 │
-        │  [horizon dial]  ● HAND: OK     │  ← orientation + status
-        │                  🔊 AUDIO ON    │
-        └──────────────────────────────────┘
-
-    Corner badges:
-        Top-right : FPS counter
-        Bottom    : keyboard shortcut reminder
+    Transparency:
+      cv2.addWeighted(overlay, 0.85, frame, 0.15, ...)
+      → 85% dark panel / 15% live frame bleed-through for high contrast
+        against any camera background (bright or dark).
     """
     h_frame, w_frame = frame.shape[:2]
 
-    # ── 1. Semi-transparent dark panel via addWeighted ──────────────────────
-    # We draw on an overlay copy and then blend it into the real frame.
-    # This avoids darkening landmarks drawn ON TOP of the panel afterward.
+    # ── Semi-transparent dark panel ───────────────────────────────────────────
     overlay = frame.copy()
-    p1 = (HUD_X,           HUD_Y)
-    p2 = (HUD_X + HUD_W,   HUD_Y + HUD_H)
-    cv2.rectangle(overlay, p1, p2, (15, 15, 15), -1)
-    # alpha=0.70 panel / 0.30 original frame for a dark-but-see-through look
-    cv2.addWeighted(overlay, 0.70, frame, 0.30, 0, frame)
+    p1 = (HUD_X, HUD_Y)
+    p2 = (HUD_X + HUD_W, HUD_Y + HUD_H)
+    cv2.rectangle(overlay, p1, p2, (10, 10, 10), -1)
+    cv2.addWeighted(overlay, 0.85, frame, 0.15, 0, frame)   # High-contrast ratio
+    cv2.rectangle(frame, p1, p2, (58, 58, 58), 1)
 
-    # Panel border
-    cv2.rectangle(frame, p1, p2, (65, 65, 65), 1)
-
-    # ── 2. Title bar ─────────────────────────────────────────────────────────
-    cv2.putText(frame, "VIRTUAL  JOYSTICK",
+    # ── Title ─────────────────────────────────────────────────────────────────
+    cv2.putText(frame, "VIRTUAL JOYSTICK",
                 (HUD_X + 10, HUD_Y + 20),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 195, 255), 1, cv2.LINE_AA)
-    # Thin separator line
+                cv2.FONT_HERSHEY_SIMPLEX, 0.54, (0, 195, 255), 1, cv2.LINE_AA)
     cv2.line(frame,
-             (HUD_X + 4,         HUD_Y + 26),
-             (HUD_X + HUD_W - 4, HUD_Y + 26),
-             (55, 55, 55), 1)
+             (HUD_X + 5, HUD_Y + 27),
+             (HUD_X + HUD_W - 5, HUD_Y + 27),
+             (48, 48, 48), 1)
 
-    # ── 3. Command label ─────────────────────────────────────────────────────
-    cmd_color = (40, 40, 255) if fist else (0, 255, 130)
+    # ── Command label ─────────────────────────────────────────────────────────
+    # Red for emergency stop; neon green for all other active states
+    cmd_color = (40, 40, 240) if fist else (0, 255, 130)
     cv2.putText(frame, command,
-                (HUD_X + 10, HUD_Y + 50),
-                cv2.FONT_HERSHEY_DUPLEX, 0.65, cmd_color, 1, cv2.LINE_AA)
+                (HUD_X + 10, HUD_Y + 52),
+                cv2.FONT_HERSHEY_DUPLEX, 0.63, cmd_color, 1, cv2.LINE_AA)
 
-    # ── 4. Speed section ─────────────────────────────────────────────────────
+    # ── Speed section ─────────────────────────────────────────────────────────
     cv2.putText(frame, "SPEED",
-                (HUD_X + 10, HUD_Y + 70),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.40, (140, 140, 140), 1, cv2.LINE_AA)
-    _draw_speed_bar(frame, speed, HUD_X + 10, HUD_Y + 76, bar_w=200, bar_h=17)
+                (HUD_X + 10, HUD_Y + 72),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.37, (120, 120, 120), 1, cv2.LINE_AA)
+    _draw_speed_bar(frame, speed, HUD_X + 10, HUD_Y + 77)
 
-    # ── 5. Orientation horizon dial ──────────────────────────────────────────
-    horizon_cx = HUD_X + 68
-    horizon_cy = HUD_Y + 155
+    # ── Orientation dial ──────────────────────────────────────────────────────
+    dial_cx = HUD_X + 70
+    dial_cy = HUD_Y + 162
     cv2.putText(frame, "TILT",
-                (horizon_cx - 14, HUD_Y + 108),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (140, 140, 140), 1, cv2.LINE_AA)
-    _draw_orientation_horizon(frame, tilt, horizon_cx, horizon_cy, radius=50)
+                (dial_cx - 13, HUD_Y + 110),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (120, 120, 120), 1, cv2.LINE_AA)
+    _draw_orientation_dial(frame, tilt, dial_cx, dial_cy, radius=50)
 
-    # ── 6. Status panel (right side of HUD) ──────────────────────────────────
-    sx = HUD_X + 152   # Right-column x origin
+    # ── Right-side status column ──────────────────────────────────────────────
+    sx = HUD_X + 160
 
-    # ESP connection target
     cv2.putText(frame, f"ESP  {ESP_IP}",
                 (sx, HUD_Y + 110),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (110, 110, 110), 1, cv2.LINE_AA)
+                cv2.FONT_HERSHEY_SIMPLEX, 0.32, (95, 95, 95), 1, cv2.LINE_AA)
     cv2.putText(frame, f"PORT {ESP_PORT}",
-                (sx, HUD_Y + 125),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (110, 110, 110), 1, cv2.LINE_AA)
+                (sx, HUD_Y + 124),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.32, (95, 95, 95), 1, cv2.LINE_AA)
 
-    # Hand detection status
-    hand_color = (0, 230, 110) if hand_visible else (70, 70, 70)
-    hand_text  = "HAND : DETECTED" if hand_visible else "HAND : NONE"
-    cv2.putText(frame, hand_text,
-                (sx, HUD_Y + 145),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.37, hand_color, 1, cv2.LINE_AA)
+    hand_col  = (0, 215, 95) if hand_visible else (65, 65, 65)
+    hand_txt  = "HAND : DETECTED" if hand_visible else "HAND : NONE"
+    cv2.putText(frame, hand_txt,
+                (sx, HUD_Y + 144),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.34, hand_col, 1, cv2.LINE_AA)
 
-    # Mute status
-    mute_color = (80, 80, 200) if muted else (0, 195, 255)
-    mute_text  = "[M] MUTED" if muted else "[M] AUDIO ON"
-    cv2.putText(frame, mute_text,
-                (sx, HUD_Y + 162),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.37, mute_color, 1, cv2.LINE_AA)
+    mute_col  = (95, 95, 200) if muted else (0, 195, 255)
+    mute_txt  = "[M] MUTED" if muted else "[M] AUDIO ON"
+    cv2.putText(frame, mute_txt,
+                (sx, HUD_Y + 160),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.34, mute_col, 1, cv2.LINE_AA)
 
-    # UDP heartbeat indicator (static label — the thread handles timing)
     cv2.putText(frame, f"UDP @ {UDP_RATE_HZ} Hz",
-                (sx, HUD_Y + 179),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (90, 90, 90), 1, cv2.LINE_AA)
+                (sx, HUD_Y + 176),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.31, (80, 80, 80), 1, cv2.LINE_AA)
 
-    # ── 7. FPS counter — top-right corner of frame ────────────────────────────
-    fps_txt = f"FPS {fps:4.1f}"
-    cv2.putText(frame, fps_txt,
+    # ── FPS counter — top-right corner, vibrant green ─────────────────────────
+    fps_str = f"FPS {fps:4.1f}"
+    cv2.putText(frame, fps_str,
                 (w_frame - 115, 24),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.52, (140, 255, 140), 1, cv2.LINE_AA)
+                cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 255, 80), 1, cv2.LINE_AA)
 
-    # ── 8. Keyboard shortcut reminder — bottom of frame ───────────────────────
-    cv2.putText(frame, "[Q] Quit      [M] Mute / Unmute Audio",
+    # ── Keyboard shortcut bar — bright white for legibility ───────────────────
+    cv2.putText(frame,
+                "[Q] Quit    [M] Mute    [R] Cinematic",
                 (10, h_frame - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (90, 90, 90), 1, cv2.LINE_AA)
+                cv2.FONT_HERSHEY_SIMPLEX, 0.37, (215, 215, 215), 1, cv2.LINE_AA)
+
+
+def draw_cinematic_overlay(frame: np.ndarray, fps: float) -> None:
+    """
+    Minimal cinematic mode indicator.
+    Shows a pulsing red REC dot + FPS in the top-right corner.
+    Everything else is hidden for a clean recording frame.
+    """
+    h, w = frame.shape[:2]
+
+    # Pulsing REC dot (brightness oscillates at 2 Hz)
+    brightness = int(150 + 105 * (0.5 + 0.5 * math.sin(time.time() * 4.0)))
+    dot_color  = (0, 0, brightness)   # BGR red, pulsing
+
+    dot_cx, dot_cy = w - 70, 18
+    cv2.circle(frame, (dot_cx, dot_cy), 5, dot_color, -1, cv2.LINE_AA)
+    cv2.putText(frame, "REC",
+                (dot_cx + 10, dot_cy + 5),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.36, dot_color, 1, cv2.LINE_AA)
+
+    # FPS counter stays visible even in cinematic mode (for tuning)
+    fps_str = f"FPS {fps:4.1f}"
+    cv2.putText(frame, fps_str,
+                (w - 115, 24),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 255, 80), 1, cv2.LINE_AA)
+
+
+def draw_watermark(frame: np.ndarray, cinematic_mode: bool) -> None:
+    """
+    Author credit watermark, bottom-right corner.
+    Rendered in ALL modes. Semi-transparent dark pill background ensures
+    it remains readable against any camera feed color.
+
+    NOTE: Slightly more opaque in cinematic mode (intentional — it's a
+    passion project marker and should appear in recordings).
+    """
+    text           = "A passion project by Nomun"
+    font, scale, t = cv2.FONT_HERSHEY_SIMPLEX, 0.38, 1
+    (tw, th), _    = cv2.getTextSize(text, font, scale, t)
+    h, w           = frame.shape[:2]
+    x = w - tw - 16
+    y = h - 12
+
+    # Semi-transparent dark pill via addWeighted on just that region
+    alpha      = 0.72 if not cinematic_mode else 0.55
+    roi_y1     = y - th - 5
+    roi_y2     = y + 5
+    roi_x1     = x - 7
+    roi_x2     = x + tw + 7
+
+    # Clamp to frame bounds
+    roi_y1 = max(0, roi_y1)
+    roi_x1 = max(0, roi_x1)
+    roi_y2 = min(h, roi_y2)
+    roi_x2 = min(w, roi_x2)
+
+    roi              = frame[roi_y1:roi_y2, roi_x1:roi_x2]
+    dark_bg          = np.full_like(roi, (0, 0, 0))
+    blended          = cv2.addWeighted(dark_bg, alpha, roi, 1.0 - alpha, 0)
+    frame[roi_y1:roi_y2, roi_x1:roi_x2] = blended
+
+    # Thin border on the pill
+    cv2.rectangle(frame, (roi_x1, roi_y1), (roi_x2, roi_y2), (45, 45, 45), 1)
+
+    # Text — neutral grey, professional, not distracting
+    cv2.putText(frame, text, (x, y), font, scale, (150, 150, 150), t, cv2.LINE_AA)
 
 
 # ==============================================================================
-# ██████  SECTION 8 — MAIN THREAD (camera loop, MediaPipe, GUI)
+# SECTION 11 — MAIN THREAD (camera loop, MediaPipe, GUI)
 # ==============================================================================
 def main() -> None:
-    log.info("=" * 60)
-    log.info(" Virtual Joystick — starting up")
-    log.info(f"  Target  : {ESP_IP}:{ESP_PORT}")
-    log.info(f"  Camera  : index {CAMERA_INDEX}  @  {TARGET_FPS} FPS cap")
-    log.info(f"  UDP rate: {UDP_RATE_HZ} Hz heartbeat")
-    log.info("=" * 60)
+    log.info("=" * 64)
+    log.info("  Virtual Joystick - Hand Gesture Controller")
+    log.info(f"  Target ESP : {ESP_IP}:{ESP_PORT}")
+    log.info(f"  Camera     : index {CAMERA_INDEX}  @  {TARGET_FPS} FPS cap")
+    log.info(f"  UDP rate   : {UDP_RATE_HZ} Hz  |  EMA alpha : {EMA_ALPHA}")
+    log.info("  Keyboard   : [Q] Quit | [M] Mute | [R] Cinematic")
+    log.info("=" * 64)
 
     # ──────────────────────────────────────────────────────────────────────────
-    # 8-A  Camera Initialisation
+    # 11-A  Camera Initialization
+    # cv2.CAP_DSHOW avoids the 2-5 s MSMF startup delay on Windows 11
     # ──────────────────────────────────────────────────────────────────────────
-    # cv2.CAP_DSHOW is a Windows-specific backend that dramatically reduces
-    # the 2–5 second delay seen with the default MSMF backend on Win 11.
     cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
-
     if not cap.isOpened():
         log.critical(
             f"FATAL: Cannot open camera at index {CAMERA_INDEX}.\n"
-            "  • Check that no other app is using the camera.\n"
-            "  • Try a different CAMERA_INDEX (0, 1, 2 …).\n"
-            "  • On WSL2: use a USB-passthrough or run natively."
+            "  - Ensure no other application holds the camera\n"
+            "  - Try CAMERA_INDEX = 1 or 2 for an external USB camera"
         )
         sys.exit(1)
 
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     cap.set(cv2.CAP_PROP_FPS,          TARGET_FPS)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)   # Keep latency minimal
-
-    actual_w   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    actual_h   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    actual_fps = cap.get(cv2.CAP_PROP_FPS)
-    log.info(f"Camera opened: {actual_w}×{actual_h} @ {actual_fps:.0f} FPS (hardware)")
+    cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)   # Minimise latency / buffer lag
+    log.info(
+        f"Camera opened: {int(cap.get(3))}x{int(cap.get(4))}"
+        f" @ {cap.get(5):.0f} fps (hardware)"
+    )
 
     # ──────────────────────────────────────────────────────────────────────────
-    # 8-B  MediaPipe Hands
+    # 11-B  MediaPipe Hands
     # ──────────────────────────────────────────────────────────────────────────
-    mp_hands   = mp.solutions.hands
-    mp_draw    = mp.solutions.drawing_utils
-    mp_styles  = mp.solutions.drawing_styles
+    mp_hands  = mp.solutions.hands
+    mp_draw   = mp.solutions.drawing_utils
+    mp_styles = mp.solutions.drawing_styles
 
     hands_model = mp_hands.Hands(
-        static_image_mode=False,      # Video stream mode (uses tracking)
-        max_num_hands=1,              # Only the primary hand matters here
+        static_image_mode=False,
+        max_num_hands=1,
         min_detection_confidence=MP_DETECT_CONF,
         min_tracking_confidence=MP_TRACK_CONF,
     )
-    log.info(f"MediaPipe Hands initialised (detect≥{MP_DETECT_CONF}, track≥{MP_TRACK_CONF})")
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # 8-C  Start Background Threads
-    # ──────────────────────────────────────────────────────────────────────────
-    audio_t = threading.Thread(
-        target=audio_thread_fn, name="AudioThread", daemon=True
-    )
-    udp_t = threading.Thread(
-        target=udp_thread_fn, name="UDPThread", daemon=True
+    log.info(
+        f"MediaPipe Hands: detect >= {MP_DETECT_CONF}, track >= {MP_TRACK_CONF}"
     )
 
+    # ──────────────────────────────────────────────────────────────────────────
+    # 11-C  EMA Filters + Smart Debouncer
+    # ──────────────────────────────────────────────────────────────────────────
+    ema_speed  = EMAFilter(alpha=EMA_ALPHA)
+    ema_tilt   = EMAFilter(alpha=EMA_ALPHA)
+    debouncer  = SmartDebouncer()
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # 11-D  Start Background Threads
+    # ──────────────────────────────────────────────────────────────────────────
+    audio_t = threading.Thread(target=audio_thread_fn, name="AudioThread", daemon=True)
+    udp_t   = threading.Thread(target=udp_thread_fn,   name="UDPThread",   daemon=True)
     audio_t.start()
     udp_t.start()
     log.info("Audio and UDP threads launched.")
 
     # ──────────────────────────────────────────────────────────────────────────
-    # 8-D  Main Loop Variables
+    # 11-E  Main Loop State Variables
     # ──────────────────────────────────────────────────────────────────────────
-    frame_interval  = 1.0 / TARGET_FPS   # Desired seconds per frame
-    last_command    = ""                  # For change-detection → announcements
-    fps_timer       = time.perf_counter()
-    fps_count       = 0
-    measured_fps    = 0.0
+    frame_interval = 1.0 / TARGET_FPS
+    fps_timer      = time.perf_counter()
+    fps_count      = 0
+    measured_fps   = 0.0
+    cinematic_mode = False
+    lm             = None       # MediaPipe landmark list; None if no hand detected
 
     try:
         while True:
             loop_start = time.perf_counter()
 
-            # ── Read frame ──────────────────────────────────────────────────
+            # ── Frame grab ────────────────────────────────────────────────────
             ret, frame = cap.read()
             if not ret or frame is None:
-                log.warning("Frame grab failed — retrying in 50 ms …")
+                log.warning("Frame grab failed — retrying in 50 ms ...")
                 time.sleep(0.05)
                 continue
 
-            # ── Mirror L/R to make hand feel like a natural "steering wheel" ──
-            # Without this flip, the user's right hand moves the car left (confusing).
-            frame = cv2.flip(frame, 1)
+            # Mirror L/R: makes the hand feel like a natural steering controller.
+            # Without this, the user's right-hand tilt moves the car LEFT (confusing).
+            frame  = cv2.flip(frame, 1)
+            h, w   = frame.shape[:2]
 
-            # ── MediaPipe inference ─────────────────────────────────────────
-            # Convert to RGB (MediaPipe requirement) and mark non-writeable
-            # to allow MediaPipe to avoid an internal copy for efficiency.
-            rgb                  = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            rgb.flags.writeable  = False
-            results              = hands_model.process(rgb)
-            rgb.flags.writeable  = True
+            # ── MediaPipe Inference ───────────────────────────────────────────
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            rgb.flags.writeable = False
+            results = hands_model.process(rgb)
+            rgb.flags.writeable = True
 
-            # ── Gesture computation ─────────────────────────────────────────
+            # ── Gesture Computation + EMA Smoothing ───────────────────────────
             hand_visible  = False
-            speed         = 0
-            tilt          = 0
             fist_detected = False
+            lm            = None
 
             if results.multi_hand_landmarks:
                 hand_visible = True
-                lm           = results.multi_hand_landmarks[0].landmark
+                lm = results.multi_hand_landmarks[0].landmark
 
-                # Draw the hand skeleton over the video frame
+                # Draw the default MediaPipe 21-point skeleton first (bottom layer)
                 mp_draw.draw_landmarks(
                     frame,
                     results.multi_hand_landmarks[0],
@@ -676,15 +912,37 @@ def main() -> None:
                 fist_detected = is_fist(lm)
 
                 if fist_detected:
-                    # Emergency stop: force everything to zero immediately
-                    speed, tilt = 0, 0
+                    raw_speed, raw_tilt = 0.0, 0.0
                 else:
-                    speed = compute_speed(lm)
-                    tilt  = compute_tilt(lm)
+                    raw_speed = compute_speed(lm)
+                    raw_tilt  = compute_tilt(lm)
+
+                # Apply EMA: smooth the values to eliminate jitter
+                smooth_speed = ema_speed.update(raw_speed)
+                smooth_tilt  = ema_tilt.update(raw_tilt)
+            else:
+                # No hand detected: feed zeros so EMA decays gracefully toward 0
+                smooth_speed = ema_speed.update(0.0)
+                smooth_tilt  = ema_tilt.update(0.0)
+
+            # Quantize smoothed floats to integers
+            speed = int(smooth_speed)
+            tilt  = int(smooth_tilt)
+
+            # Apply dead zones AFTER smoothing (prevents micro-jitter from
+            # toggling commands while near the dead zone boundary)
+            if speed < SPEED_DEAD_ZONE:
+                speed = 0
+            if abs(tilt) < TILT_DEAD_ZONE:
+                tilt = 0
+
+            # Override: fist always forces stop regardless of smoothed values
+            if fist_detected:
+                speed, tilt = 0, 0
 
             command = classify_command(speed, tilt, fist_detected)
 
-            # ── Write to shared state (UDP thread reads this) ───────────────
+            # ── Write shared state (UDP thread reads this) ────────────────────
             with state_lock:
                 shared_state["speed"]        = speed
                 shared_state["tilt"]         = tilt
@@ -694,14 +952,10 @@ def main() -> None:
                 shared_state["fps"]          = measured_fps
                 muted                        = shared_state["muted"]
 
-            # ── Announce state changes via TTS ──────────────────────────────
-            if command != last_command:
-                log.info(f"Command: {last_command!r:20s} → {command!r}")
-                # Convert to natural speech: "FORWARD LEFT" → "forward left"
-                announce(command.replace("_", " ").lower())
-                last_command = command
+            # ── Smart Audio Debouncing ────────────────────────────────────────
+            debouncer.update(command, speed)
 
-            # ── FPS measurement (updated every second) ──────────────────────
+            # ── FPS Measurement (updated every second) ────────────────────────
             fps_count += 1
             now = time.perf_counter()
             if now - fps_timer >= 1.0:
@@ -709,78 +963,92 @@ def main() -> None:
                 fps_count    = 0
                 fps_timer    = now
 
-            # ── Render HUD overlay ──────────────────────────────────────────
-            draw_hud(
-                frame, speed, tilt, command, measured_fps,
-                muted, fist_detected, hand_visible,
-            )
+            # ── Layer 2: Iron Man Neon Geometry (drawn in BOTH modes) ─────────
+            if hand_visible and lm is not None:
+                draw_iron_man_visuals(frame, lm, speed, w, h)
 
-            # ── Show window ─────────────────────────────────────────────────
-            cv2.imshow("Virtual Joystick — Hand Gesture Robot Controller", frame)
+            # ── Layer 3: HUD Panel OR Cinematic Minimal Overlay ───────────────
+            if not cinematic_mode:
+                draw_hud(
+                    frame, speed, tilt, command, measured_fps,
+                    muted, fist_detected, hand_visible,
+                )
+            else:
+                draw_cinematic_overlay(frame, measured_fps)
 
-            # ── Keyboard handling ───────────────────────────────────────────
+            # ── Layer 4: Watermark (always visible) ───────────────────────────
+            draw_watermark(frame, cinematic_mode)
+
+            # ── Display ───────────────────────────────────────────────────────
+            # Window title uses ONLY standard ASCII characters to avoid
+            # OpenCV window-title rendering bugs on Windows
+            cv2.imshow("Virtual Joystick - Hand Gesture Controller", frame)
+
+            # ── Keyboard Input ────────────────────────────────────────────────
             key = cv2.waitKey(1) & 0xFF
 
-            if key == ord("q") or key == 27:   # 'q' or Esc
-                log.info("Quit key pressed — initiating shutdown …")
+            if key in (ord("q"), 27):          # 'q' or Escape
+                log.info("Quit key pressed — initiating shutdown ...")
                 break
 
             elif key == ord("m"):
                 with state_lock:
                     shared_state["muted"] = not shared_state["muted"]
                     is_muted = shared_state["muted"]
-                announce("audio muted" if is_muted else "audio on")
+                announce("muted" if is_muted else "audio on")
                 log.info(f"Audio {'MUTED' if is_muted else 'UNMUTED'} by user.")
 
-            # ── Hard FPS cap: sleep for the remainder of the frame budget ───
-            elapsed    = time.perf_counter() - loop_start
-            sleep_for  = frame_interval - elapsed
+            elif key == ord("r"):
+                cinematic_mode = not cinematic_mode
+                mode_name = "CINEMATIC" if cinematic_mode else "CONTROL"
+                announce(f"{mode_name.lower()} mode")
+                log.info(f"Mode toggled -> {mode_name}")
+
+            # ── Hard FPS Cap: sleep for the remaining frame budget ────────────
+            elapsed   = time.perf_counter() - loop_start
+            sleep_for = frame_interval - elapsed
             if sleep_for > 0:
                 time.sleep(sleep_for)
 
     except KeyboardInterrupt:
-        log.info("KeyboardInterrupt — shutting down …")
+        log.info("KeyboardInterrupt received — shutting down ...")
 
     # ──────────────────────────────────────────────────────────────────────────
-    # 8-E  Graceful Shutdown
-    # Signal all background threads, drain queue, wait for joins.
+    # 11-F  Graceful Shutdown
     # ──────────────────────────────────────────────────────────────────────────
     finally:
-        log.info("Cleaning up …")
+        log.info("Cleaning up threads and resources ...")
 
-        # 1. Tell threads to exit
+        # Signal all threads to exit
         with state_lock:
             shared_state["running"] = False
 
-        # 2. Send sentinel to audio queue so the thread unblocks and exits
+        # Send None sentinel to unblock the audio thread's queue.get()
         try:
             audio_queue.put(None, timeout=1.0)
         except queue.Full:
             pass
 
-        # 3. Wait for threads (with a timeout so we never hang indefinitely)
+        # Wait with timeouts so we never hang indefinitely
         audio_t.join(timeout=4.0)
         udp_t.join(timeout=2.0)
 
         if audio_t.is_alive():
-            log.warning("Audio thread did not exit cleanly within timeout.")
+            log.warning("Audio thread did not exit within timeout (4 s).")
         if udp_t.is_alive():
-            log.warning("UDP thread did not exit cleanly within timeout.")
+            log.warning("UDP thread did not exit within timeout (2 s).")
 
-        # 4. Release camera and destroy OpenCV windows
         cap.release()
         cv2.destroyAllWindows()
-
-        # 5. Close MediaPipe resources
         hands_model.close()
 
-        log.info("=" * 60)
-        log.info(" Virtual Joystick — stopped cleanly.")
-        log.info("=" * 60)
+        log.info("=" * 64)
+        log.info("  Virtual Joystick - stopped cleanly.")
+        log.info("=" * 64)
 
 
 # ==============================================================================
-# ██████  ENTRY POINT
+# ENTRY POINT
 # ==============================================================================
 if __name__ == "__main__":
     main()
