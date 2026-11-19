@@ -13,7 +13,7 @@
 [![PlatformIO](https://img.shields.io/badge/PlatformIO-Firmware-FF7F00?logo=platformio&logoColor=white)](https://platformio.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-[![Watch the demo](https://img.youtube.com/vi/cJ4aoS0Kbfs/maxresdefault.jpg)](https://youtube.com/shorts/cJ4aoS0Kbfs)
+[![Watch the demo](https://img.youtube.com/vi/cJ4aoS0Kbfs/maxresdefault.jpg)](https://youtube.com/shorts/sd9DHlLlZOo)
 
 *Click above to watch the demo on YouTube Shorts*
 
